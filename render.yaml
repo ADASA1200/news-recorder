@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: news-recorder
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python recording_server.py
+    plan: free
