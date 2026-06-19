@@ -9,11 +9,14 @@ RECORDING_STATUS = {}    # name -> 'recording' / 'ready' / 'error'
 
 TZ = ZoneInfo('Asia/Jerusalem')
 
-# ───────── הגדרות תזמון ─────────
+# ───────── הגדרות ─────────
 TARGET_SECOND   = 5            # השנייה שבה הקובץ הסופי יתחיל (XX:00:05)
-PRE_ROLL_SEC    = 8            # כמה שניות לפני היעד להתחיל להקליט בפועל
-FINAL_DURATION  = 7 * 60       # אורך הקובץ הסופי (7 דקות = 420ש)
-RAW_DURATION    = PRE_ROLL_SEC + FINAL_DURATION + 10   # אורך ההקלטה הגולמית
+PRE_ROLL_SEC    = 10           # שניות לפני היעד להתחיל להקליט (סופג השהיית התחברות/נפילות)
+FINAL_DURATION  = 7 * 60       # אורך הקובץ הסופי (7 דקות)
+RAW_DURATION    = PRE_ROLL_SEC + FINAL_DURATION + 15   # אורך ההקלטה הגולמית
+
+# סף מינימלי לקובץ תקין (בייטים). 64kbps ≈ 8KB לשנייה, אז 7 דק' ≈ 3.3MB.
+MIN_VALID_BYTES = 200000       # ~25 שניות - אם פחות מזה, נחשב כישלון
 
 
 @app.route('/ping')
@@ -22,7 +25,7 @@ def ping():
 
 
 def seconds_until_target():
-    """כמה שניות עד XX:00:05 הקרוב, ומה התאריך-שעה של היעד."""
+    """כמה שניות עד XX:00:05 הקרוב, ומהו התאריך-שעה של היעד."""
     now = datetime.now(TZ)
     target = now.replace(minute=0, second=TARGET_SECOND, microsecond=0)
     if now >= target:
@@ -30,13 +33,31 @@ def seconds_until_target():
     return (target - now).total_seconds(), target
 
 
-def _stderr_tail(result, n=1500):
+def _stderr_tail(result, n=1800):
     try:
         if result and result.stderr:
             return result.stderr.decode('utf-8', 'ignore')[-n:]
     except Exception:
         pass
     return '(אין פלט שגיאה)'
+
+
+def run_ffmpeg_record(url, out_path, duration):
+    """
+    הקלטה גולמית מסטרים חי.
+    דגלי reconnect: ffmpeg מתחבר מחדש אוטומטית כשהסטרים נופל,
+    במקום לעצור. סט נקי שעובד גם ל-HLS (קול חי) וגם ל-Icecast (קול ברמה).
+    """
+    return subprocess.run([
+        'ffmpeg', '-y',
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '4',
+        '-i', url,
+        '-t', str(duration), '-vn',
+        '-acodec', 'libmp3lame', '-ab', '64k',
+        '-ar', '22050', '-ac', '1', out_path
+    ], capture_output=True, timeout=duration + 90)
 
 
 @app.route('/record', methods=['POST'])
@@ -54,36 +75,33 @@ def record():
             # 1) ממתינים עד PRE_ROLL שניות לפני היעד
             wait_to_target, target = seconds_until_target()
             wait_to_start = max(0, wait_to_target - PRE_ROLL_SEC)
-            app.logger.info(f'[{name}] יעד: {target.strftime("%H:%M:%S")} | '
-                            f'ממתין {wait_to_start:.1f}ש')
+            app.logger.info(f'[{name}] יעד: {target.strftime("%H:%M:%S")} | ממתין {wait_to_start:.1f}ש')
             if wait_to_start > 0:
                 time.sleep(wait_to_start)
 
-            # 2) רגע ההתחלה בפועל
-            actual_start = datetime.now(TZ)
-            app.logger.info(f'[{name}] מתחיל ffmpeg ב-{actual_start.strftime("%H:%M:%S")}')
-
-            # 3) הקלטה גולמית — פקודה זהה למקור שעבד, ללא דגלים מיוחדים.
-            #    עובדת גם ל-HLS (קול חי) וגם ל-Icecast (קול ברמה).
-            result = subprocess.run([
-                'ffmpeg', '-y', '-i', url,
-                '-t', str(RAW_DURATION), '-vn',
-                '-acodec', 'libmp3lame', '-ab', '64k',
-                '-ar', '22050', '-ac', '1', raw_path
-            ], capture_output=True, timeout=RAW_DURATION + 60)
+            # 2) הקלטה גולמית (עד 2 ניסיונות אם הראשון יוצא ריק/קצר מדי)
+            result = None
+            actual_start = None
+            for attempt in (1, 2):
+                actual_start = datetime.now(TZ)
+                app.logger.info(f'[{name}] ניסיון {attempt}: מתחיל ffmpeg ב-{actual_start.strftime("%H:%M:%S")}')
+                result = run_ffmpeg_record(url, raw_path, RAW_DURATION)
+                raw_size = os.path.getsize(raw_path) if os.path.exists(raw_path) else 0
+                app.logger.info(f'[{name}] ניסיון {attempt}: גלם {raw_size} bytes, rc={result.returncode}')
+                if raw_size >= MIN_VALID_BYTES:
+                    break
+                app.logger.error(f'[{name}] ניסיון {attempt} קצר/ריק. stderr:\n{_stderr_tail(result)}')
+                # אם נכשל ועוד יש זמן - מנסים שוב מיד (ההקלטה תהיה קצרה יותר אבל עדיף מכלום)
 
             raw_size = os.path.getsize(raw_path) if os.path.exists(raw_path) else 0
-            app.logger.info(f'[{name}] גלם: {raw_size} bytes, ffmpeg rc={result.returncode}')
-
-            if raw_size < 10000:
-                app.logger.error(f'[{name}] הקלטה נכשלה. stderr:\n{_stderr_tail(result)}')
+            if raw_size < MIN_VALID_BYTES:
+                app.logger.error(f'[{name}] כל הניסיונות נכשלו')
                 RECORDING_STATUS[name] = 'error'
                 return
 
-            # 4) חיתוך מדויק כך שהתוצאה מתחילה ב-XX:00:05
+            # 3) חיתוך מדויק כך שהתוצאה מתחילה ב-XX:00:05
             offset = max(0, (target - actual_start).total_seconds())
             app.logger.info(f'[{name}] חיתוך מ-{offset:.2f}ש, אורך {FINAL_DURATION}ש')
-
             cut = subprocess.run([
                 'ffmpeg', '-y',
                 '-ss', f'{offset:.2f}',
@@ -94,24 +112,22 @@ def record():
             ], capture_output=True, timeout=120)
 
             final_size = os.path.getsize(final_path) if os.path.exists(final_path) else 0
-
-            if final_size > 10000:
-                # חיתוך הצליח - משתמשים בקובץ החתוך, מוחקים את הגלם
+            if final_size >= MIN_VALID_BYTES:
                 RECORDINGS[name] = final_path
                 RECORDING_STATUS[name] = 'ready'
-                app.logger.info(f'[{name}] מוכן (חתוך): {final_size} bytes')
+                app.logger.info(f'[{name}] ✓ מוכן (חתוך): {final_size} bytes')
                 try:
                     os.remove(raw_path)
                 except OSError:
                     pass
             else:
-                # חיתוך נכשל - גיבוי: משתמשים בקובץ הגולמי כדי לא לאבד הקלטה
+                # גיבוי: החיתוך נכשל - משתמשים בגלם כדי לא לאבד הקלטה
                 app.logger.error(f'[{name}] חיתוך נכשל, משתמש בגלם. stderr:\n{_stderr_tail(cut)}')
                 RECORDINGS[name] = raw_path
                 RECORDING_STATUS[name] = 'ready'
 
         except subprocess.TimeoutExpired:
-            app.logger.error(f'[{name}] timeout בהקלטה')
+            app.logger.error(f'[{name}] timeout')
             RECORDING_STATUS[name] = 'error'
         except Exception as e:
             app.logger.error(f'[{name}] שגיאה: {e}')
